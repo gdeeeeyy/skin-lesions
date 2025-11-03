@@ -10,7 +10,7 @@ import tempfile
 import tensorflow as tf
 
 from utils.model_io import load_keras_model, get_model_input_size, preprocess_for_model
-from utils.gradcam import compute_gradcam, overlay_heatmap
+from utils.gradcam import compute_gradcam, overlay_heatmap, list_conv_like_layers
 from utils.gemini import gemini_analyze
 
 st.set_page_config(page_title="Skin Lesion Analyzer", layout="wide")
@@ -59,11 +59,85 @@ if run_btn:
         st.stop()
 
     # Determine expected input size
+    def infer_input_size_from_model(model):
+        """
+        Try several Keras/TF attributes to extract (H, W, C).
+        Returns tuple (H, W, C) or raises ValueError.
+        """
+        candidates = []
+
+        # model.input_shape (legacy)
+        if hasattr(model, "input_shape") and model.input_shape is not None:
+            candidates.append(model.input_shape)
+
+        # model.inputs -> tf.Tensor shapes
+        if hasattr(model, "inputs"):
+            try:
+                for inp in model.inputs:
+                    # TensorShape -> list
+                    shape = getattr(inp, "shape", None)
+                    if shape is not None:
+                        try:
+                            candidates.append(tuple(shape.as_list()))
+                        except Exception:
+                            # shape may already be tuple-like
+                            candidates.append(tuple(shape))
+            except Exception:
+                pass
+
+        # Search for InputLayer among layers
+        if hasattr(model, "layers"):
+            for layer in getattr(model, "layers", []):
+                try:
+                    if layer.__class__.__name__ == "InputLayer":
+                        shp = getattr(layer, "input_shape", None)
+                        if shp is not None:
+                            candidates.append(shp)
+                except Exception:
+                    continue
+
+        # Normalize candidates and pick first complete (H,W,C) with numeric dims
+        for s in candidates:
+            if s is None:
+                continue
+            s_list = list(s)
+            # remove batch dim if present
+            if len(s_list) == 4:
+                _, h, w, c = s_list
+            elif len(s_list) == 3:
+                h, w, c = s_list
+            else:
+                continue
+            if h is None or w is None:
+                continue
+            try:
+                return int(h), int(w), int(c)
+            except Exception:
+                continue
+
+        raise ValueError("Unable to infer (H,W,C) from model attributes")
+
     try:
-        target_h, target_w, channels = get_model_input_size(model)
+        try:
+            target_h, target_w, channels = get_model_input_size(model)
+        except Exception:
+            # fallback inference from model internals
+            target_h, target_w, channels = infer_input_size_from_model(model)
     except Exception as e:
-        st.error(f"Couldn't infer model input size: {e}")
-        st.stop()
+        # Ask user to provide input size manually instead of failing
+        st.warning(f"Couldn't infer model input size automatically: {e}")
+        st.info("Please enter the model's expected input height, width, and channels.")
+        target_h = int(st.number_input("Input height (pixels)", min_value=1, value=224))
+        target_w = int(st.number_input("Input width (pixels)", min_value=1, value=224))
+        channels = int(st.selectbox("Channels", options=[1, 3], index=1))
+        # Continue without st.stop()
+
+    # Resize uploaded image to model input size so heatmap and image align
+    try:
+        pil_img = pil_img.resize((int(target_w), int(target_h)), resample=Image.BILINEAR)
+    except Exception:
+        # If resize fails for any reason, continue with the original image
+        pass
 
     with st.spinner("Preprocessing & predicting..."):
         x = preprocess_for_model(pil_img, (target_h, target_w))
@@ -89,18 +163,33 @@ if run_btn:
         try:
             heatmap = compute_gradcam(model, x, class_index=top_idx)
         except Exception as e:
-            st.warning(f"Grad-CAM failed: {e}")
-            heatmap = None
+            # If no conv layer found, offer user a list of candidate layers to pick from
+            msg = str(e)
+            if "No convolutional layer found" in msg or "list_conv_like_layers" in msg:
+                candidates = list_conv_like_layers(model)
+                if candidates:
+                    sel = st.selectbox("Select layer to use for Grad-CAM", options=candidates)
+                    try:
+                        heatmap = compute_gradcam(model, x, class_index=top_idx, layer_name=sel)
+                    except Exception as e2:
+                        st.warning(f"Grad-CAM failed with selected layer: {e2}")
+                        heatmap = None
+                else:
+                    st.warning("No candidate conv-like layers found in the model; skipping Grad-CAM.")
+                    heatmap = None
+            else:
+                st.warning(f"Grad-CAM failed: {e}")
+                heatmap = None
 
     with col_left:
         st.subheader("Original Image")
-        st.image(pil_img, use_column_width=True)
+        st.image(pil_img, use_container_width=True)
 
     with col_right:
         st.subheader("Grad-CAM Overlay")
         if heatmap is not None:
             overlay = overlay_heatmap(pil_img, heatmap, alpha=0.45)
-            st.image(overlay, use_column_width=True)
+            st.image(overlay, use_container_width=True)
         else:
             st.info("No heatmap available.")
 
